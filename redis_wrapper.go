@@ -26,6 +26,8 @@ const (
 	leaseDuration     = 15 * time.Second
 	heartbeatInterval = 5 * time.Second
 
+	deferDelay = 3 * time.Second
+
 	retryDelay     = 5 * time.Second
 	baseRetryDelay = 1 * time.Second
 	maxRetryDelay  = 30 * time.Second
@@ -408,6 +410,60 @@ var promoteRetryJobScript = redis.NewScript(`
     )
 
     return 1
+`)
+
+var deferJobScript = redis.NewScript(`
+    local currentOwner = redis.call(
+        "HGET",
+        KEYS[3],
+        ARGV[1]
+    )
+
+    if not currentOwner then
+        return 0
+    end
+
+    if currentOwner ~= ARGV[2] then
+        return -1
+    end
+
+    local removed = redis.call(
+        "LREM",
+        KEYS[1],
+        1,
+        ARGV[1]
+    )
+
+    if removed == 0 then
+        return -2
+    end
+
+    redis.call(
+        "ZREM",
+        KEYS[2],
+        ARGV[1]
+    )
+
+    redis.call(
+        "HDEL",
+        KEYS[3],
+        ARGV[1]
+    )
+
+    local redisTime = redis.call("TIME")
+    local now = tonumber(redisTime[1])
+
+    local delay = tonumber(ARGV[3])
+    local retryAt = now + delay
+
+    redis.call(
+        "ZADD",
+        KEYS[4],
+        retryAt,
+        ARGV[1]
+    )
+
+    return delay
 `)
 
 func acquireLock(
@@ -801,6 +857,60 @@ func promoteRetryJob(
 	default:
 		return fmt.Errorf(
 			"unexpected retry promotion result=%d",
+			result,
+		)
+	}
+}
+
+func deferJob(
+	ctx context.Context,
+	rdb *redis.Client,
+	job *ClaimedJob,
+) error {
+
+	result, err := deferJobScript.Run(
+		ctx,
+		rdb,
+		[]string{
+			processingQueue,
+			leaseSet,
+			ownerSet,
+			retrySet,
+		},
+		job.JobID,
+		job.Token,
+		int64(deferDelay.Seconds()),
+	).Int()
+
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case result > 0:
+		return nil
+
+	case result == 0:
+		return fmt.Errorf(
+			"cannot defer job=%s: owner not found",
+			job.JobID,
+		)
+
+	case result == -1:
+		return fmt.Errorf(
+			"cannot defer job=%s: ownership lost",
+			job.JobID,
+		)
+
+	case result == -2:
+		return fmt.Errorf(
+			"cannot defer job=%s: processing invariant violated",
+			job.JobID,
+		)
+
+	default:
+		return fmt.Errorf(
+			"unexpected defer result=%d",
 			result,
 		)
 	}

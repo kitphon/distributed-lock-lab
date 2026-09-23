@@ -64,7 +64,39 @@ func runWorker(
 
 		err = handleJob(ctx, rdb, workerID, job)
 
-		if errors.Is(err, ErrResourceLocked) {
+		if err != nil {
+
+			log.Printf(
+				"[%s] process job=%s order=%s failed: %v",
+				workerID,
+				job.JobID,
+				job.OrderID,
+				err,
+			)
+
+			if errors.Is(err, ErrResourceLocked) {
+				if deferErr := deferJob(ctx, rdb, job); deferErr != nil {
+					log.Printf(
+						"[%s] defer job=%s order=%s failed: %v",
+						workerID,
+						job.JobID,
+						job.OrderID,
+						deferErr,
+					)
+
+					continue
+				}
+
+				fmt.Printf(
+					"[%s] DEFER job=%s order=%s delay=%s\n",
+					workerID,
+					job.JobID,
+					job.OrderID,
+					deferDelay,
+				)
+
+				continue
+			}
 
 			result, nackErr := nackJob(ctx, rdb, job)
 			if nackErr != nil {
@@ -101,18 +133,6 @@ func runWorker(
 			continue
 		}
 
-		if err != nil {
-			log.Printf(
-				"[%s] process job=%s order=%s failed: %v",
-				workerID,
-				job.JobID,
-				job.OrderID,
-				err,
-			)
-
-			continue
-		}
-
 		if err := ackJob(ctx, rdb, job); err != nil {
 			log.Printf(
 				"[%s] ACK order=%s failed: %v",
@@ -129,5 +149,6 @@ func runWorker(
 			workerID,
 			job.OrderID,
 		)
+
 	}
 }
