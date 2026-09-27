@@ -20,6 +20,8 @@ const (
 	jobData       = "jobs:orders:data"
 	retrySet      = "jobs:orders:retry"
 	retryCountSet = "jobs:orders:retry-count"
+	completedSet  = "jobs:orders:completed"
+	effectCount   = "jobs:orders:effect-count"
 
 	deadLetterQueue = "jobs:orders:dlq"
 
@@ -464,6 +466,33 @@ var deferJobScript = redis.NewScript(`
     )
 
     return delay
+`)
+
+var commitOrderScript = redis.NewScript(`
+    local completed = redis.call(
+        "SISMEMBER",
+        KEYS[1],
+        ARGV[1]
+    )
+
+    if completed == 1 then
+        return 0
+    end
+
+    redis.call(
+        "HINCRBY",
+        KEYS[2],
+        ARGV[1],
+        1
+    )
+
+    redis.call(
+        "SADD",
+        KEYS[1],
+        ARGV[1]
+    )
+
+    return 1
 `)
 
 func acquireLock(
@@ -911,6 +940,41 @@ func deferJob(
 	default:
 		return fmt.Errorf(
 			"unexpected defer result=%d",
+			result,
+		)
+	}
+}
+
+func commitOrderEffect(
+	ctx context.Context,
+	rdb *redis.Client,
+	orderID string,
+) (bool, error) {
+
+	result, err := commitOrderScript.Run(
+		ctx,
+		rdb,
+		[]string{
+			completedSet,
+			effectCount,
+		},
+		orderID,
+	).Int()
+
+	if err != nil {
+		return false, err
+	}
+
+	switch result {
+	case 1:
+		return true, nil
+
+	case 0:
+		return false, nil
+
+	default:
+		return false, fmt.Errorf(
+			"unexpected commit result=%d",
 			result,
 		)
 	}

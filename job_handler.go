@@ -21,9 +21,36 @@ func handleJob(
 	job *ClaimedJob,
 ) error {
 
+	completed, err := isOrderCompleted(
+		ctx,
+		rdb,
+		job.OrderID,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	if completed {
+		fmt.Printf(
+			"[%s] order=%s already completed, skip before lock job=%s\n",
+			workerID,
+			job.OrderID,
+			job.JobID,
+		)
+
+		return nil
+	}
+
 	token := workerID + ":" + uuid.NewString()
 
-	acquired, err := acquireLock(ctx, rdb, job.OrderID, token, 10*time.Second)
+	acquired, err := acquireLock(
+		ctx,
+		rdb,
+		job.OrderID,
+		token,
+		10*time.Second,
+	)
 
 	if err != nil {
 		return err
@@ -45,6 +72,43 @@ func handleJob(
 		job.OrderID,
 		token,
 	)
+
+	defer func() {
+		if err := releaseLock(
+			context.Background(),
+			rdb,
+			job.OrderID,
+			token,
+		); err != nil {
+			log.Printf(
+				"[%s] release lock order=%s failed: %v",
+				workerID,
+				job.OrderID,
+				err,
+			)
+		}
+	}()
+
+	completed, err = isOrderCompleted(
+		ctx,
+		rdb,
+		job.OrderID,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	if completed {
+		fmt.Printf(
+			"[%s] order=%s already completed, skip after lock job=%s\n",
+			workerID,
+			job.OrderID,
+			job.JobID,
+		)
+
+		return nil
+	}
 
 	jobCtx, cancelJob := context.WithCancel(ctx)
 
@@ -81,18 +145,31 @@ func handleJob(
 		job.OrderID,
 	)
 
+	if err == nil {
+		applied, commitErr := commitOrderEffect(
+			jobCtx,
+			rdb,
+			job.OrderID,
+		)
+
+		if commitErr != nil {
+			err = fmt.Errorf(
+				"commit order effect: %w",
+				commitErr,
+			)
+		} else if applied {
+			fmt.Printf(
+				"[%s] committed business effect order=%s\n",
+				workerID,
+				job.OrderID,
+			)
+
+		}
+	}
+
 	cancelJob()
 
 	heartbeatWG.Wait()
-
-	if releaseErr := releaseLock(ctx, rdb, job.OrderID, token); releaseErr != nil {
-		log.Printf(
-			"[%s] release lock order=%s failed: %v",
-			workerID,
-			job.OrderID,
-			releaseErr,
-		)
-	}
 
 	return err
 }

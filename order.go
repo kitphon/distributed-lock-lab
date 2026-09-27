@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func processOrder(
@@ -33,4 +35,23 @@ func processOrder(
 
 		return nil
 	}
+}
+
+func isOrderCompleted(
+	ctx context.Context,
+	rdb *redis.Client,
+	orderID string,
+) (bool, error) {
+
+	completed, err := rdb.SIsMember(
+		ctx,
+		completedSet,
+		orderID,
+	).Result()
+
+	if err != nil {
+		return false, err
+	}
+
+	return completed, nil
 }
