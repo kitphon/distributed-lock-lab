@@ -259,6 +259,53 @@ var nackJobScript = redis.NewScript(`
     }
 `)
 
+var abandonJobScript = redis.NewScript(`
+    local currentOwner = redis.call(
+        "HGET",
+        KEYS[3],
+        ARGV[1]
+    )
+
+    if not currentOwner then
+        return 0
+    end
+
+    if currentOwner ~= ARGV[2] then
+        return -1
+    end
+
+    local removed = redis.call(
+        "LREM",
+        KEYS[1],
+        1,
+        ARGV[1]
+    )
+
+    if removed == 0 then
+        return -2
+    end
+
+    redis.call(
+        "ZREM",
+        KEYS[2],
+        ARGV[1]
+    )
+
+    redis.call(
+        "HDEL",
+        KEYS[3],
+        ARGV[1]
+    )
+
+    redis.call(
+        "LPUSH",
+        KEYS[4],
+        ARGV[1]
+    )
+
+    return 1
+`)
+
 var recoverJobScript = redis.NewScript(`
     local leaseUntil = redis.call(
         "ZSCORE",
@@ -847,6 +894,60 @@ func nackJob(
 		RetryDelay: retryDelay,
 		DeadLetter: false,
 	}, nil
+}
+
+func abandonJob(
+	ctx context.Context,
+	rdb *redis.Client,
+	job *ClaimedJob,
+) error {
+
+	result, err := abandonJobScript.Run(
+		ctx,
+		rdb,
+		[]string{
+			processingQueue,
+			leaseSet,
+			ownerSet,
+			pendingQueue,
+		},
+		job.JobID,
+		job.Token,
+	).Int()
+
+	if err != nil {
+		return err
+	}
+
+	switch result {
+	case 1:
+		return nil
+
+	case 0:
+		return fmt.Errorf(
+			"abandon job=%s: owner missing",
+			job.JobID,
+		)
+
+	case -1:
+		return fmt.Errorf(
+			"abandon job=%s: ownership lost",
+			job.JobID,
+		)
+
+	case -2:
+		return fmt.Errorf(
+			"abandon job=%s: invariant violation: job not in processing",
+			job.JobID,
+		)
+
+	default:
+		return fmt.Errorf(
+			"abandon job=%s: unexpected result=%d",
+			job.JobID,
+			result,
+		)
+	}
 }
 
 func promoteRetryJob(

@@ -74,8 +74,13 @@ func handleJob(
 	)
 
 	defer func() {
+		cleanupCtx, cancelCleanup :=
+			newCleanupContext()
+
+		defer cancelCleanup()
+
 		if err := releaseLock(
-			context.Background(),
+			cleanupCtx,
 			rdb,
 			job.OrderID,
 			token,

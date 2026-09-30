@@ -4,19 +4,29 @@ import (
 	"context"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
+const shutdownGracePeriod = 20 * time.Second
+
 func main() {
-	ctx := context.Background()
+	shutdownCtx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:       "localhost:6379",
 		ClientName: "redis-lock-lab",
 	})
 
-	if err := rdb.Ping(ctx).Err(); err != nil {
+	if err := rdb.Ping(shutdownCtx).Err(); err != nil {
 		log.Fatal(err)
 	}
 
@@ -26,12 +36,12 @@ func main() {
 
 	switch os.Args[1] {
 	case "producer":
-		runProducer(ctx, rdb)
+		runProducer(shutdownCtx, rdb)
 
 	case "worker":
-		go runRecoveryWorker(ctx, rdb)
-		go runRetryScheduler(ctx, rdb)
-		runWorker(ctx, rdb)
+		go runRecoveryWorker(shutdownCtx, rdb)
+		go runRetryScheduler(shutdownCtx, rdb)
+		runWorker(shutdownCtx, rdb)
 
 	default:
 		log.Fatal("unknown command")

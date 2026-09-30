@@ -14,7 +14,7 @@ import (
 const idlePollInterval = 500 * time.Millisecond
 
 func runWorker(
-	ctx context.Context,
+	shutdownCtx context.Context,
 	rdb *redis.Client,
 ) {
 	workerID := uuid.NewString()[:8]
@@ -26,19 +26,31 @@ func runWorker(
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-shutdownCtx.Done():
+			fmt.Printf(
+				"[%s] shutdown requested: stop claiming\n",
+				workerID,
+			)
 			return
 
 		default:
 		}
 
 		job, err := claimJob(
-			ctx,
+			shutdownCtx,
 			rdb,
 			workerID,
 		)
 
 		if err != nil {
+			if shutdownCtx.Err() != nil {
+				fmt.Printf(
+					"[%s] shutdown requested during claim\n",
+					workerID,
+				)
+				return
+			}
+
 			log.Printf(
 				"[%s] claim error: %v",
 				workerID,
@@ -50,8 +62,17 @@ func runWorker(
 		}
 
 		if job == nil {
-			time.Sleep(idlePollInterval)
-			continue
+			select {
+			case <-shutdownCtx.Done():
+				fmt.Printf(
+					"[%s] shutdown requested while idle\n",
+					workerID,
+				)
+				return
+
+			case <-time.After(idlePollInterval):
+				continue
+			}
 		}
 
 		fmt.Printf(
@@ -62,10 +83,101 @@ func runWorker(
 			job.Token,
 		)
 
-		err = handleJob(ctx, rdb, workerID, job)
+		jobCtx, cancelJobCtx := context.WithCancel(
+			context.Background(),
+		)
+
+		jobResult := make(chan error, 1)
+
+		go func() {
+			jobResult <- handleJob(
+				jobCtx,
+				rdb,
+				workerID,
+				job,
+			)
+		}()
+
+		shutdownDuringJob := false
+		graceExpired := false
+
+		select {
+		case err = <-jobResult:
+			cancelJobCtx()
+
+		case <-shutdownCtx.Done():
+			shutdownDuringJob = true
+
+			fmt.Printf(
+				"[%s] shutdown requested: draining job=%s\n",
+				workerID,
+				job.JobID,
+			)
+
+			timer := time.NewTimer(
+				shutdownGracePeriod,
+			)
+
+			select {
+			case err = <-jobResult:
+				timer.Stop()
+
+				fmt.Printf(
+					"[%s] job=%s finished during grace period\n",
+					workerID,
+					job.JobID,
+				)
+
+			case <-timer.C:
+				graceExpired = true
+
+				fmt.Printf(
+					"[%s] grace period exceeded: cancelling job=%s\n",
+					workerID,
+					job.JobID,
+				)
+
+				cancelJobCtx()
+
+				err = <-jobResult
+			}
+
+			cancelJobCtx()
+		}
+
+		if shutdownDuringJob && graceExpired {
+			cleanupCtx, cancelCleanup := newCleanupContext()
+			abandonErr := abandonJob(
+				cleanupCtx,
+				rdb,
+				job,
+			)
+
+			cancelCleanup()
+
+			if abandonErr != nil {
+				log.Printf(
+					"[%s] ABANDON job=%s order=%s failed: %v",
+					workerID,
+					job.JobID,
+					job.OrderID,
+					abandonErr,
+				)
+
+				return
+			}
+
+			fmt.Printf(
+				"[%s] ABANDON job=%s order=%s -> pending\n",
+				workerID,
+				job.JobID,
+				job.OrderID,
+			)
+
+			return
+		}
 
 		if err != nil {
-
 			log.Printf(
 				"[%s] process job=%s order=%s failed: %v",
 				workerID,
@@ -75,7 +187,12 @@ func runWorker(
 			)
 
 			if errors.Is(err, ErrResourceLocked) {
-				if deferErr := deferJob(ctx, rdb, job); deferErr != nil {
+				cleanupCtx, cancelCleanup := newCleanupContext()
+				deferErr := deferJob(cleanupCtx, rdb, job)
+
+				cancelCleanup()
+
+				if deferErr != nil {
 					log.Printf(
 						"[%s] defer job=%s order=%s failed: %v",
 						workerID,
@@ -83,6 +200,10 @@ func runWorker(
 						job.OrderID,
 						deferErr,
 					)
+
+					if shutdownDuringJob {
+						return
+					}
 
 					continue
 				}
@@ -95,10 +216,18 @@ func runWorker(
 					deferDelay,
 				)
 
+				if shutdownDuringJob {
+					return
+				}
+
 				continue
 			}
 
-			result, nackErr := nackJob(ctx, rdb, job)
+			cleanupCtx, cancelCleanup := newCleanupContext()
+			result, nackErr := nackJob(cleanupCtx, rdb, job)
+
+			cancelCleanup()
+
 			if nackErr != nil {
 				log.Printf(
 					"[%s] NACK job=%s failed: %v",
@@ -106,6 +235,10 @@ func runWorker(
 					job.JobID,
 					nackErr,
 				)
+
+				if shutdownDuringJob {
+					return
+				}
 
 				continue
 			}
@@ -119,6 +252,10 @@ func runWorker(
 					result.RetryCount-1,
 				)
 
+				if shutdownDuringJob {
+					return
+				}
+
 				continue
 			}
 
@@ -130,16 +267,30 @@ func runWorker(
 				result.RetryDelay,
 			)
 
+			if shutdownDuringJob {
+				return
+			}
+
 			continue
 		}
 
-		if err := ackJob(ctx, rdb, job); err != nil {
+		cleanupCtx, cancelCleanup := newCleanupContext()
+
+		ackErr := ackJob(cleanupCtx, rdb, job)
+
+		cancelCleanup()
+
+		if ackErr != nil {
 			log.Printf(
 				"[%s] ACK order=%s failed: %v",
 				workerID,
 				job.OrderID,
-				err,
+				ackErr,
 			)
+
+			if shutdownDuringJob {
+				return
+			}
 
 			continue
 		}
@@ -150,5 +301,22 @@ func runWorker(
 			job.OrderID,
 		)
 
+		if shutdownDuringJob {
+			fmt.Printf(
+				"[%s] shutdown complete after draining job=%s\n",
+				workerID,
+				job.JobID,
+			)
+
+			return
+		}
+
 	}
+}
+
+func newCleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
 }
